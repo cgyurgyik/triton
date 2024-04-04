@@ -1,9 +1,10 @@
 # flake8: noqa: F821,F841
 import itertools
 import re
-from typing import Optional, Union
+from typing import Optional, Union, List
 import math
 import textwrap
+import tempfile
 
 import numpy as np
 import pytest
@@ -2398,7 +2399,6 @@ def test_scan_layouts(M, N, src_layout, axis, device):
     }}
     """
 
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -2536,7 +2536,6 @@ def test_reduce_layouts(M, N, src_layout, axis, epilogue_kind, dtype_str, reduce
         }}) {{axis = {axis} : i32}} : (tensor<{M}x{N}x{ty}, #src>) -> tensor<{rdims_1d}x{ty}, #{GPU_DIALECT}.slice<{{dim = {axis}, parent = #src}}>>
     """ + epilogue
 
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -2591,7 +2590,6 @@ def test_store_op(M, src_layout, device):
     }}
     """
 
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -2642,7 +2640,6 @@ def test_convert1d(M, src_layout, dst_layout, src_dim, dst_dim, device):
         }}
     }}
     """
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -2725,7 +2722,6 @@ def test_chain_reduce(M, N, src_layout, op, device, first_axis):
     }}
     }}
     """
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -4743,8 +4739,6 @@ def test_convert2d(M, N, src_layout, interm_layout, dst_layout, dtype, device):
     x = to_triton(numpy_random((M, N), dtype_str=dtype), device=device)
     z = torch.empty_like(x, device=device)
 
-    # write the IR to a temporary file using mkstemp
-    import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
         f.write(ir)
         f.flush()
@@ -4752,6 +4746,94 @@ def test_convert2d(M, N, src_layout, interm_layout, dst_layout, dtype, device):
     kernel[(1, 1, 1)](x.data_ptr(), z.data_ptr())
 
     assert torch.equal(z, x)
+
+
+@pytest.mark.parametrize("shape", [
+    (32, 32),
+    # TODO(jlebar): This test fails if we add (128, 1) or (1, 128) to the list
+    # of shapes.  Our LLVM codegen has a bug affecting #mma local_loads where
+    # the shape is smaller than the MMA instruction size.  Currently we have an
+    # assert preventing us from generating the bad code, but we haven't figured
+    # out how to fix it properly.
+    # (128, 1),
+    # (1, 128),
+])
+@pytest.mark.parametrize("in_order", [(0, 1), (1, 0)])
+@pytest.mark.parametrize("out_order", [(0, 1), (1, 0)])
+@pytest.mark.parametrize("vec", [1, 4])
+@pytest.mark.parametrize("per_phase", [1, 4])
+@pytest.mark.parametrize("max_phase", [1, 4])
+@pytest.mark.parametrize("shared_order", [(0, 1), (1, 0)])
+def test_async_load(shape: List[int], in_order: List[int], shared_order: List[int], out_order: List[int], vec: int,
+                    per_phase: int, max_phase: int, device: str):
+    if shape[1] == 1 and (per_phase > 1 or max_phase > 1):
+        pytest.skip("Can't swizzle an effectively-1D tensor")
+
+    SHAPE = "x".join(str(s) for s in shape)
+    IN_ORDER = ",".join(str(i) for i in in_order)
+    SHARED_ORDER = ",".join(str(i) for i in shared_order)
+    OUT_ORDER = ",".join(str(i) for i in out_order)
+    ir = f"""
+    #src = #triton_gpu.blocked<{{sizePerThread=[1,1], threadsPerWarp=[{THREADS_PER_WARP},1], warpsPerCTA=[4,1], order=[{IN_ORDER}]}}>
+    #slice0 = #triton_gpu.slice<{{dim=0, parent=#src}}>
+    #slice1 = #triton_gpu.slice<{{dim=1, parent=#src}}>
+    #shared = #triton_gpu.shared<{{vec={vec}, perPhase={per_phase}, maxPhase={max_phase}, order=[{SHARED_ORDER}], hasLeadingOffset=false}}>
+    #dst = #triton_gpu.blocked<{{sizePerThread=[1,1], threadsPerWarp=[{THREADS_PER_WARP},1], warpsPerCTA=[4,1], order=[{OUT_ORDER}]}}>
+    #mma = #triton_gpu.nvidia_mma<{{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8]}}>
+    module attributes {{"triton_gpu.num-warps" = 4 : i32, "triton_gpu.num-ctas" = 1 : i32, "triton_gpu.threads-per-warp" = {THREADS_PER_WARP} : i32}} {{
+    tt.func public @test(%in: !tt.ptr<f32, 1>, %out: !tt.ptr<f32, 1>, %slice_idx: i32) {{
+      %seq0 = tt.make_range {{end = {shape[0]} : i32, start = 0 : i32}} : tensor<{shape[0]}xi32, #slice1>
+      %shape1_size = arith.constant {shape[1]} : i32
+      %shape1_size_splat = tt.splat %shape1_size : i32 -> tensor<{shape[0]}xi32, #slice1>
+      %seq0.1 = arith.muli %seq0, %shape1_size_splat : tensor<{shape[0]}xi32, #slice1>
+      %seq0.2 = tt.expand_dims %seq0.1 {{axis = 1 : i32}} : tensor<{shape[0]}xi32, #slice1> -> tensor<{shape[0]}x1xi32, #src>
+      %seq0.3 = tt.broadcast %seq0.2 : tensor<{shape[0]}x1xi32, #src> -> tensor<{SHAPE}xi32, #src>
+
+      %seq1 = tt.make_range {{end = {shape[1]} : i32, start = 0 : i32}} : tensor<{shape[1]}xi32, #slice0>
+      %seq1.1 = tt.expand_dims %seq1 {{axis = 0 : i32}} : tensor<{shape[1]}xi32, #slice0> -> tensor<1x{shape[1]}xi32, #src>
+      %seq1.2 = tt.broadcast %seq1.1 : tensor<1x{shape[1]}xi32, #src> -> tensor<{SHAPE}xi32, #src>
+      %seq = arith.addi %seq0.3, %seq1.2 : tensor<{SHAPE}xi32, #src>
+
+      %in_splat = tt.splat %in : !tt.ptr<f32, 1> -> tensor<{SHAPE}x!tt.ptr<f32, 1>, #src>
+      %in_ptrs = tt.addptr %in_splat, %seq : tensor<{SHAPE}x!tt.ptr<f32, 1>, #src>, tensor<{SHAPE}xi32, #src>
+
+      %alloc = triton_gpu.local_alloc : () -> !tt.memdesc<3x{SHAPE}xf32, #shared>
+      %zero = arith.constant 0 : i32
+      %subview = triton_gpu.memdesc_subview %alloc[%slice_idx, %zero, %zero] :
+        !tt.memdesc<3x{SHAPE}xf32, #shared> -> !tt.memdesc<{SHAPE}xf32, #shared, mutable>
+      %tok0 = triton_gpu.async_copy_global_to_local %in_ptrs, %subview
+        {{cache=1: i32, evict=1: i32, isVolatile=false}} :
+        tensor<{SHAPE}x!tt.ptr<f32, 1>, #src> -> <{SHAPE}xf32, #shared, mutable>
+      %tok = triton_gpu.async_commit_group %tok0
+      triton_gpu.async_wait %tok {{num = 0: i32}}
+
+      %outs_mma = triton_gpu.local_load %subview : !tt.memdesc<{SHAPE}xf32, #shared, mutable> -> tensor<{SHAPE}xf32, #mma>
+      %outs = triton_gpu.convert_layout %outs_mma : tensor<{SHAPE}xf32, #mma> -> tensor<{SHAPE}xf32, #dst>
+      %out_splat = tt.splat %out : !tt.ptr<f32, 1> -> tensor<{SHAPE}x!tt.ptr<f32, 1>, #dst>
+      %seq_out = triton_gpu.convert_layout %seq : tensor<{SHAPE}xi32, #src> -> tensor<{SHAPE}xi32, #dst>
+      %out_ptrs = tt.addptr %out_splat, %seq_out : tensor<{SHAPE}x!tt.ptr<f32, 1>, #dst>, tensor<{SHAPE}xi32, #dst>
+      tt.store %out_ptrs, %outs : tensor<{SHAPE}xf32, #dst>
+      tt.return
+    }}
+    }}
+    """
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
+        f.write(ir)
+        f.flush()
+        try:
+            kernel = triton.compile(f.name)
+        except RuntimeError:
+            print("Failing IR is:")
+            print(ir)
+            raise
+    in_vals = torch.arange(math.prod(shape), device=device, dtype=torch.float32).reshape(shape).contiguous() + 42
+    out_vals = torch.full(shape, -1, dtype=torch.float32, device=device)
+
+    # Our choice of slice_idx shouldn't matter, so long as it's in [0,3).
+    slice_idx = 1
+    kernel[(1, 1, 1)](in_vals, out_vals, slice_idx)
+
+    assert torch.equal(in_vals, out_vals)
 
 
 mma_pairs = [
@@ -4839,8 +4921,6 @@ def test_convertmma2mma(M, N, mma_pair, dtype, device):
         x = to_triton(numpy_random((M, N), dtype_str=dtype), device=device)
         z = torch.empty_like(x)
 
-        # write the IR to a temporary file using mkstemp
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir') as f:
             f.write(ir)
             f.flush()
